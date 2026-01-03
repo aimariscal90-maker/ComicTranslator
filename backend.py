@@ -7,6 +7,9 @@ import io  # Para leer archivos como bytes
 import math  # Para operaciones matemáticas (raíz cuadrada, etc.)
 import textwrap  # Para dividir texto en líneas
 import unicodedata
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # Librerías de procesamiento de imágenes
 import cv2  # OpenCV - para procesamiento de imágenes y visión por computadora
 import numpy as np  # NumPy - para arrays y operaciones matemáticas con imágenes
@@ -64,6 +67,9 @@ class ComicTranslator:
         
         # Crear el cliente de OpenAI con la clave
         self.client = OpenAI(api_key=api_key)
+        
+        # Caché de traducciones para ahorrar llamadas repetidas
+        self.translation_cache = {}
         
         # ====================================================================
         # PASO 2: Configurar Google Cloud Vision para detección de texto
@@ -164,256 +170,342 @@ class ComicTranslator:
     
     def detect_text_google(self, image_path: str) -> List[Tuple[List[List[int]], str, float]]:
         """
-        Detecta texto en la imagen usando Google Cloud Vision API.
-        
-        Google Vision detecta BLOQUES completos de texto (párrafos),
-        lo que resuelve el problema de fragmentación (texto dividido en palabras).
-        
-        Proceso:
-        1. Lee la imagen como bytes
-        2. Envía a Google Cloud Vision
-        3. Procesa la respuesta (Páginas -> Bloques -> Párrafos -> Palabras)
-        4. Reconstruye el texto completo de cada bloque
-        5. Filtra detecciones muy pequeñas (ruido)
-        
-        Args:
-            image_path: Ruta al archivo de imagen
-            
-        Returns:
-            Lista de tuplas: (bbox, texto, confianza)
+        Detecta texto usando Google Cloud Vision con:
+        - Validación y redimensionado previo (límite 4096px / 20MB).
+        - Reintentos con backoff exponencial.
+        - Filtrado por confianza y tamaño mínimo razonable.
+        - Validación de texto imprimible.
         """
-        # Leer el archivo de imagen como bytes (requerido por Google Vision)
+        from PIL import Image as PILImage
+
+        # ============================================================
+        # Validación y posible redimensionado antes de enviar a Google
+        # ============================================================
         try:
+            with PILImage.open(image_path) as img:
+                width, height = img.size
+                file_size_mb = os.path.getsize(image_path) / (1024 * 1024)
+
+                if width > 4096 or height > 4096 or file_size_mb > 20:
+                    max_dim = max(width, height)
+                    scale = 4096 / max_dim if max_dim > 0 else 1.0
+                    new_w = int(width * scale)
+                    new_h = int(height * scale)
+                    img_resized = img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+                    temp_path = image_path + "_resized.jpg"
+                    img_resized.save(temp_path, "JPEG", quality=85)
+                    image_path = temp_path
+                    logging.info(f"Imagen redimensionada: {width}x{height} -> {new_w}x{new_h}")
+
             with io.open(image_path, 'rb') as image_file:
                 content = image_file.read()
         except Exception as e:
-            raise IOError(f"Error al leer el archivo de imagen: {e}")
-        
-        # Crear objeto Image de Google Vision
-        image = vision.Image(content=content)
-        
-        # Llamar a la API de Google Cloud Vision
-        # document_text_detection es mejor para texto denso (cómics)
-        try:
-            response = self.vision_client.document_text_detection(image=image)
-        except Exception as e:
-            raise RuntimeError(f"Error en Google Cloud Vision API: {e}")
-        
-        # Verificar si hay errores en la respuesta
-        if response.error.message:
-            raise Exception(f'Error en Google Cloud Vision API: {response.error.message}')
-        
-        # Lista para almacenar todas las detecciones
+            raise IOError(f"Error al leer/preparar la imagen: {e}")
+
+        # ============================================================
+        # Reintentos con backoff exponencial
+        # ============================================================
+        max_retries = 3
+        retry_delay = 1
+        response = None
+
+        for attempt in range(max_retries):
+            try:
+                image = vision.Image(content=content)
+                response = self.vision_client.document_text_detection(image=image)
+                if response.error.message:
+                    raise Exception(response.error.message)
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logging.warning(f"Error Vision (intento {attempt+1}): {e}. Reintentando en {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    raise RuntimeError(f"Google Vision falló tras {max_retries} intentos: {e}")
+
         detections = []
-        
-        # ====================================================================
-        # Procesar la respuesta de Google Vision
-        # ====================================================================
-        # Estructura de Google: Páginas -> Bloques -> Párrafos -> Palabras -> Símbolos
-        # Nosotros queremos los BLOQUES para obtener frases completas
-        
+        min_confidence = 0.3
+        min_area = 20  # área mínima razonable
+
         for page in response.full_text_annotation.pages:
             for block in page.blocks:
                 block_text = ""
-                
-                # Reconstruir el texto del bloque uniendo párrafos y palabras
+
+                # Reconstrucción del texto
+                word_confidences = []
                 for paragraph in block.paragraphs:
                     para_text = ""
                     for word in paragraph.words:
-                        # Unir todos los símbolos (letras) de cada palabra
                         word_text = ''.join([symbol.text for symbol in word.symbols])
-                        para_text += word_text + " "  # Agregar espacio entre palabras
+                        para_text += word_text + " "
+                        if hasattr(word, 'confidence'):
+                            word_confidences.append(word.confidence)
                     block_text += para_text
-                
-                # Limpiar espacios al inicio y final
+
                 block_text = block_text.strip()
-                
-                # Saltar bloques vacíos
                 if not block_text:
                     continue
-                
-                # Obtener coordenadas del bloque (Bounding Box)
+
+                # Confianza promedio de palabras o del bloque
+                if word_confidences:
+                    confidence = sum(word_confidences) / len(word_confidences)
+                else:
+                    confidence = block.confidence if hasattr(block, 'confidence') else 0.5
+
+                # Filtrado por confianza
+                if confidence < min_confidence:
+                    continue
+
+                # Bounding box
                 vertices = block.bounding_box.vertices
-                
-                # Convertir formato de Google [[x,y], [x,y]...] a nuestro formato
                 bbox = [[v.x, v.y] for v in vertices]
-                
-                # Obtener confianza del bloque (Google da confianza por palabra, usamos la del bloque)
-                confidence = block.confidence if hasattr(block, 'confidence') else 0.9
-                
-                # ============================================================
-                # Filtro de tamaño - MUY PERMISIVO para capturar texto pequeño
-                # ============================================================
+
                 x_coords = [v.x for v in vertices]
                 y_coords = [v.y for v in vertices]
-                w = max(x_coords) - min(x_coords)  # Ancho del bloque
-                h = max(y_coords) - min(y_coords)  # Alto del bloque
-                
-                # Solo filtrar detecciones microscópicas (probablemente ruido)
-                # Reducido a 1 píxel para ser lo más permisivo posible
-                if w < 1 or h < 1:
+                w = max(x_coords) - min(x_coords)
+                h = max(y_coords) - min(y_coords)
+
+                # Filtrado de tamaño mínimo (área)
+                if w < 1 or h < 1 or (w * h) < min_area:
                     continue
-                
-                # Agregar a la lista de detecciones
+
+                # Validar que tenga caracteres alfanuméricos
+                if not any(c.isalnum() for c in block_text):
+                    continue
+
                 detections.append((bbox, block_text, confidence))
-        
+
+        # Limpiar archivo temporal si se creó
+        if image_path.endswith("_resized.jpg") and os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
+
         return detections
     
     def get_contour_mask(self, image: np.ndarray, bbox: List[List[int]]) -> Tuple[Optional[np.ndarray], Tuple[int, int, int, int]]:
         """
-        MODIFICADO (General): Usa precisión quirúrgica.
-        - Padding reducido (10 -> 4) para no invadir vecinos.
-        - Dilatación suave (2 -> 1) para tapar solo lo justo.
+        Versión mejorada:
+        - Padding adaptativo según tamaño del globo.
+        - Selección de contorno con sistema de puntuación (área, centro, circularidad, aspecto).
+        - Dilatación adaptativa para cubrir texto sin invadir bordes.
         """
         x_min, y_min, x_max, y_max = self.get_bbox_rect(bbox)
         height, width = image.shape[:2]
-        
-        # CAMBIO: Usamos un margen muy pequeño. Solo queremos holgura para curvas, no espacio extra.
-        padding = 4 
+
+        # Padding adaptativo: 2% del tamaño mayor del globo, mínimo 5px, máximo 30px
+        box_w = x_max - x_min
+        box_h = y_max - y_min
+        box_size = max(box_w, box_h)
+        padding = max(5, min(30, int(box_size * 0.02)))
+
         roi_x_min = max(0, x_min - padding)
         roi_y_min = max(0, y_min - padding)
         roi_x_max = min(width, x_max + padding)
         roi_y_max = min(height, y_max + padding)
-        
+
         roi = image[roi_y_min:roi_y_max, roi_x_min:roi_x_max]
         if roi.size == 0:
             return None, (0, 0, 0, 0)
-        
+
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        # Blur fijo (podría hacerse adaptativo si se quiere)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Otsu es bueno y general para separar texto del fondo
+
+        # Umbralización Otsu
         _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
+
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None, (roi_x_min, roi_y_min, roi_x_max, roi_y_max)
-        
-        # Lógica para encontrar el contorno que realmente contiene el texto
+
+        # Centro del texto relativo al ROI
         orig_cx = (x_min + x_max) // 2 - roi_x_min
         orig_cy = (y_min + y_max) // 2 - roi_y_min
-        
+
         best_contour = None
-        max_area = 0
+        best_score = -1
+
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 50: continue # Ignorar ruido
-            
-            # Verificar si el centro del texto está dentro o MUY cerca del contorno
+            if area < 50:
+                continue
+
+            score = 0
+
+            # Factor área
+            score += area * 0.001
+
+            # Factor centro
             dist = cv2.pointPolygonTest(contour, (orig_cx, orig_cy), True)
-            if dist > -20: 
-                if area > max_area:
-                    max_area = area
-                    best_contour = contour
-        
+            if dist >= 0:
+                score += 1000
+            elif dist > -20:
+                score += 500 - (abs(dist) * 10)
+
+            # Factor circularidad
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                circularity = 4 * math.pi * area / (perimeter * perimeter)
+                if 0.3 <= circularity <= 1.5:
+                    score += 200
+
+            # Factor proporción ancho/alto
+            rect = cv2.boundingRect(contour)
+            aspect_ratio = rect[2] / max(rect[3], 1)
+            if 0.2 <= aspect_ratio <= 5.0:
+                score += 100
+
+            if score > best_score:
+                best_score = score
+                best_contour = contour
+
         if best_contour is None:
-            # Fallback general: Si no coincide el centro, cogemos el más grande (suele ser el globo)
             best_contour = max(contours, key=cv2.contourArea)
-        
+
         mask = np.zeros_like(gray)
         cv2.drawContours(mask, [best_contour], -1, 255, -1)
-        
-        # CAMBIO: Solo 1 iteración. Tapamos el texto original, pero respetamos los bordes negros.
+
+        # Dilatación adaptativa: más grande para globos grandes, max 3 iteraciones
+        dilation_iterations = max(1, min(3, int(box_size / 200)))
         kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=1)
-        
+        mask = cv2.dilate(mask, kernel, iterations=dilation_iterations)
+
         return mask, (roi_x_min, roi_y_min, roi_x_max, roi_y_max)
     
     def get_bubble_color_from_mask(self, image: np.ndarray, mask: np.ndarray, 
                                    roi_coords: Tuple[int, int, int, int]) -> Tuple[int, int, int]:
         """
-        Detecta el color dominante del fondo del globo desde el área de la máscara.
-        
-        En lugar de usar un rectángulo simple, solo analiza los píxeles
-        dentro de la máscara (la forma real del globo).
-        
-        Proceso:
-        1. Extraer píxeles solo donde la máscara es blanca (área del globo)
-        2. Usar mediana (no promedio) para evitar ruido del texto negro
-        3. Retornar color en formato BGR
-        
-        Args:
-            image: Imagen completa (formato BGR)
-            mask: Máscara binaria (blanco = área del globo)
-            roi_coords: Coordenadas (x1, y1, x2, y2) del ROI
-            
-        Returns:
-            Tupla de color BGR (Blue, Green, Red)
+        Detecta el color dominante del globo usando K-means (más robusto que la mediana).
+        - Filtra píxeles oscuros (texto) antes de clústerizar.
+        - Si hay pocos píxeles, cae a mediana.
         """
         x1, y1, x2, y2 = roi_coords
         roi = image[y1:y2, x1:x2]
         
-        # Verificar que las dimensiones coincidan
         if roi.shape[:2] != mask.shape[:2]:
-            return (255, 255, 255)  # Por defecto blanco
+            return (255, 255, 255)
         
-        # Extraer píxeles solo donde la máscara es blanca (área del globo)
         masked_pixels = roi[mask == 255]
-        
-        # Si hay muy pocos píxeles, retornar blanco por defecto
         if len(masked_pixels) < 10:
             return (255, 255, 255)
         
-        # Usar mediana (no promedio) para evitar ruido del texto negro
-        # La mediana es más robusta a valores extremos
-        avg_color = np.median(masked_pixels, axis=0)
+        # Filtrar texto (píxeles oscuros)
+        gray_pixels = 0.299 * masked_pixels[:, 2] + 0.587 * masked_pixels[:, 1] + 0.114 * masked_pixels[:, 0]
+        bright_mask = gray_pixels > 50  # Umbral de brillo
+        background_pixels = masked_pixels[bright_mask] if bright_mask.any() else masked_pixels
         
+        if len(background_pixels) < 10:
+            background_pixels = masked_pixels
+        
+        # K-means para color dominante
+        if len(background_pixels) >= 3:
+            pixels_float = background_pixels.reshape(-1, 3).astype(np.float32)
+            k = min(3, len(background_pixels))
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+            try:
+                _, labels, centers = cv2.kmeans(pixels_float, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+                unique, counts = np.unique(labels, return_counts=True)
+                dominant_idx = unique[np.argmax(counts)]
+                dominant_color = centers[dominant_idx]
+                return (int(dominant_color[0]), int(dominant_color[1]), int(dominant_color[2]))
+            except Exception:
+                pass  # Si falla K-means, caemos a mediana
+        
+        avg_color = np.median(background_pixels, axis=0)
         return (int(avg_color[0]), int(avg_color[1]), int(avg_color[2]))
     
     def translate_text(self, text: str) -> str:
         """
         Traduce texto de inglés a español (España) usando OpenAI API.
-        
-        MANTIENE ESTRICTAMENTE LAS MAYÚSCULAS/MINÚSCULAS ORIGINALES
-        para preservar los matices de voz del cómic.
-        
-        Ejemplos:
-        - "HELP!" -> "¡AYUDA!" (mantiene mayúsculas)
-        - "Help!" -> "¡Ayuda!" (mantiene minúsculas)
-        
-        Proceso:
-        1. Crear mensaje de sistema con instrucciones específicas
-        2. Enviar texto a OpenAI
-        3. Recibir traducción
-        4. Limpiar espacios
-        
-        Args:
-            text: Texto en inglés a traducir
-            
-        Returns:
-            Texto traducido al español con mayúsculas/minúsculas preservadas
+        - Usa caché para evitar llamadas repetidas.
+        - Maneja textos largos partiéndolos en chunks.
+        - Reintenta ante errores temporales.
         """
-        try:
-            # Llamar a la API de OpenAI con instrucciones estrictas de fidelidad
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Modelo económico y rápido
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Eres un traductor profesional de cómics EN->ES (España). "
-                            "Reglas CRÍTICAS:\n"
-                            "1. Mantén el significado exacto y el tono.\n"
-                            "2. NO traduzcas Nombres Propios de personajes (ej: 'Immortus', 'Death's Head', 'Stark', 'Maker'). Déjalos tal cual.\n"
-                            "3. Si el texto parece cortado o incompleto, tradúcelo lo mejor posible basándote en el contexto, NO lo dejes en inglés.\n"
-                            "4. Mantén MAYÚSCULAS/minúsculas originales.\n"
-                            "5. Solo devuelve el texto traducido, nada más."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ],
-                temperature=0.2,  # Baja temperatura = más determinista
-                max_tokens=500  # Límite de tokens
-            )
-            
-            # Extraer y limpiar la traducción
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"Error de traducción: {e}")
-            return text  # En caso de error, retornar texto original
+        # Caché
+        if text in self.translation_cache:
+            return self.translation_cache[text]
+
+        # Textos vacíos
+        if not text or len(text.strip()) == 0:
+            return text
+
+        # Si es muy largo, dividir en chunks aproximados
+        max_chunk_length = 400
+        if len(text) > max_chunk_length:
+            sentences = text.split('. ')
+            chunks = []
+            current = ""
+            for sentence in sentences:
+                if len(current) + len(sentence) < max_chunk_length:
+                    current += sentence + ". "
+                else:
+                    if current:
+                        chunks.append(current.strip())
+                    current = sentence + ". "
+            if current:
+                chunks.append(current.strip())
+
+            translated_chunks = [self._translate_chunk(chunk) for chunk in chunks]
+            result = " ".join(translated_chunks)
+            self.translation_cache[text] = result
+            return result
+
+        result = self._translate_chunk(text)
+        self.translation_cache[text] = result
+        return result
+
+    def _translate_chunk(self, text: str) -> str:
+        """Helper para traducir un chunk con retry y validación."""
+        max_retries = 3
+        retry_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Eres un traductor profesional de cómics EN->ES (España). "
+                                "Reglas CRÍTICAS:\n"
+                                "1. Mantén el significado exacto y el tono.\n"
+                                "2. NO traduzcas Nombres Propios de personajes (ej: 'Immortus', 'Death's Head', 'Stark', 'Maker'). Déjalos tal cual.\n"
+                                "3. Si el texto parece cortado o incompleto, tradúcelo lo mejor posible basándote en el contexto.\n"
+                                "4. Mantén MAYÚSCULAS/minúsculas originales.\n"
+                                "5. Usa '...' en lugar de '…'.\n"
+                                "6. Devuelve solo el texto traducido, nada más."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": text
+                        }
+                    ],
+                    temperature=0.2,
+                    max_tokens=500
+                )
+
+                translated = response.choices[0].message.content.strip()
+
+                # Validación básica: no devolver traducciones vacías o demasiado cortas
+                if not translated or len(translated) < max(3, int(len(text) * 0.1)):
+                    raise ValueError("Traducción sospechosamente corta o vacía")
+
+                return translated
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logging.warning(f"Error de traducción (intento {attempt+1}): {e}. Reintentando en {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"❌ Error de traducción tras {max_retries} intentos: {e}")
+                    return text  # Fall back al original
     
     def render_text_in_mask(self, image: np.ndarray, text: str, bbox: List[List[int]], 
                            font_path: Optional[str], text_color: Tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
@@ -484,8 +576,8 @@ class ComicTranslator:
             line_spacing = int(font_size * 0.1) 
 
             # --- CÁLCULO HORIZONTAL ---
-            # Usamos 'M' para asegurar que caben las mayúsculas anchas
-            avg_char_w = font.getlength("M")
+            # Usamos 'x' para asegurar que caben las mayúsculas anchas
+            avg_char_w = font.getlength("x")
             if avg_char_w == 0: avg_char_w = 1 # Evitar div por cero
             
             # Estimación inicial de caracteres por línea
@@ -543,129 +635,100 @@ class ComicTranslator:
     
     def process_image(self, image_path: str) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Función principal de procesamiento: detecta, traduce y renderiza texto.
-        
-        Este es el método principal que orquesta todo el proceso:
-        
-        1. Cargar imagen
-        2. Detectar texto usando Google Cloud Vision
-        3. Para cada detección:
-           a. Filtrar cajas muy grandes (títulos de página completa)
-           b. Traducir texto
-           c. Obtener máscara del globo (forma orgánica)
-           d. Detectar color del fondo del globo
-           e. Rellenar el área del globo con el color detectado
-           f. Determinar color del texto (negro o blanco según brillo del fondo)
-           g. Renderizar texto traducido
-        
-        Args:
-            image_path: Ruta al archivo de imagen
-            
-        Returns:
-            Tupla de (imagen_original, imagen_procesada)
+        Función principal: detecta, traduce y renderiza texto.
+        Mejoras:
+        - Procesamiento en paralelo de globos.
+        - Manejo de errores por globo (uno fallido no detiene el resto).
+        - Logging informativo.
         """
-        # Cargar imagen
+        logger = logging.getLogger(__name__)
+
         original_image = self.load_image(image_path)
         processed_image = original_image.copy()
-        
-        # ====================================================================
-        # PASO 1: Detectar texto usando Google Cloud Vision
-        # ====================================================================
-        # Google Vision detecta bloques completos (resuelve fragmentación)
-        text_results = self.detect_text_google(image_path)
-        
-        # Si no hay detecciones, retornar imágenes sin cambios
+
+        try:
+            text_results = self.detect_text_google(image_path)
+        except Exception as e:
+            logger.error(f"Error en detección de texto: {e}")
+            return original_image, processed_image
+
         if not text_results:
             return original_image, processed_image
-        
-        # ====================================================================
-        # PASO 2: Procesar cada detección - MÁXIMA SENSITIVIDAD
-        # ====================================================================
-        for bbox, text, confidence in text_results:
-            # Filtrar solo cajas muy grandes (títulos de página completa)
-            # PERMITIR cajas pequeñas - queremos capturar texto pequeño como "Ouch", "Eh?", "NO"
-            height, width = original_image.shape[:2]
-            x_min, y_min, x_max, y_max = self.get_bbox_rect(bbox)
-            box_area = (x_max - x_min) * (y_max - y_min)
-            total_area = height * width
-            
-            # Filtrar solo si es demasiado grande (títulos de página completa)
-            # NO filtrar por área mínima - queremos capturar texto pequeño
-            if box_area > (total_area * self.max_bubble_area_ratio):
-                continue
-            
-            # NO filtrar por confianza - Google Vision es suficientemente preciso, queremos todo
-            # NO filtrar por longitud de texto - queremos traducir "NO", "AY", "Eh?", "Ouch", etc.
-            
-            # ================================================================
-            # Traducir texto (mantiene mayúsculas/minúsculas originales)
-            # ================================================================
-            translated_text = self.translate_text(text)
-            # Si la traducción llega vacía por algún motivo, usar el texto original
-            if not translated_text.strip():
-                translated_text = text
-            
-            # ================================================================
-            # Obtener máscara del contorno para inpainting orgánico
-            # ================================================================
-            mask, (rx1, ry1, rx2, ry2) = self.get_contour_mask(original_image, bbox)
-            
-            target_bbox = bbox
-            text_color = (0, 0, 0)  # Por defecto negro
-            
-            if mask is not None:
-                # Obtener color del globo
-                fill_color = self.get_bubble_color_from_mask(original_image, mask, (rx1, ry1, rx2, ry2))
-                
-                # --- CAMBIO: ELIMINAMOS EL FORZADO DE BLANCO ---
-                # Borramos el bloque "if brightness > 220: fill_color = (255,255,255)"
-                # Confiamos en que get_bubble_color_from_mask nos dé el color real (sea gris, crema o negro).
-                
-                # Calcular brillo para decidir color de texto
-                # Fórmula estándar de luminancia: (0.299*R + 0.587*G + 0.114*B)
-                brightness = (fill_color[2] * 0.299 + fill_color[1] * 0.587 + fill_color[0] * 0.114)
-                
-                # Aplicar color de relleno (Inpainting)
-                roi_target = processed_image[ry1:ry2, rx1:rx2]
-                roi_target[mask == 255] = fill_color
-                
-                # Decidir color del texto (Contraste General)
-                # Si el fondo es oscuro (<128), texto blanco. Si es claro, texto negro.
-                text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
-                
-                # Actualizar target_bbox para que coincida con los límites de la máscara
-                # para mejor centrado
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    largest = max(contours, key=cv2.contourArea)
-                    mx, my, mw, mh = cv2.boundingRect(largest)
-                    
-                    # AJUSTE PRO: Añadimos un micro-margen interno (padding negativo)
-                    # para asegurarnos de que el texto no toque los bordes blancos irregulares
-                    # Es como dejar un marco de seguridad dentro del cuadro.
-                    
-                    # Corrección de coordenadas relativas a absolutas
-                    final_x = rx1 + mx
-                    final_y = ry1 + my
-                    final_w = mw
-                    final_h = mh
 
-                    target_bbox = [
-                        [final_x, final_y],
-                        [final_x + final_w, final_y],
-                        [final_x + final_w, final_y + final_h],
-                        [final_x, final_y + final_h]
-                    ]
-            else:
-                # Fallback: relleno simple con rectángulo blanco
-                x1, y1, x2, y2 = self.get_bbox_rect(bbox)
-                cv2.rectangle(processed_image, (x1, y1), (x2, y2), (255, 255, 255), -1)
-            
-            # ================================================================
-            # Renderizar texto traducido
-            # ================================================================
-            processed_image = self.render_text_in_mask(
-                processed_image, translated_text, target_bbox, self.font_path, text_color
-            )
-        
+        # Función interna para procesar un globo
+        def process_single_bubble(bubble_data):
+            bbox, text, confidence = bubble_data
+            try:
+                height, width = original_image.shape[:2]
+                x_min, y_min, x_max, y_max = self.get_bbox_rect(bbox)
+                box_area = (x_max - x_min) * (y_max - y_min)
+                total_area = height * width
+
+                # Filtrar solo globos gigantes (títulos de página completa)
+                if box_area > (total_area * self.max_bubble_area_ratio):
+                    return None
+
+                # Traducir
+                translated_text = self.translate_text(text)
+                if not translated_text.strip():
+                    translated_text = text
+
+                # Máscara
+                mask, (rx1, ry1, rx2, ry2) = self.get_contour_mask(original_image, bbox)
+                target_bbox = bbox
+                text_color = (0, 0, 0)
+
+                if mask is not None:
+                    fill_color = self.get_bubble_color_from_mask(original_image, mask, (rx1, ry1, rx2, ry2))
+                    brightness = (fill_color[2] * 0.299 + fill_color[1] * 0.587 + fill_color[0] * 0.114)
+                    text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
+
+                    # Aplicar relleno
+                    roi_target = processed_image[ry1:ry2, rx1:rx2].copy()
+                    roi_target[mask == 255] = fill_color
+
+                    # Actualizar bbox según la máscara
+                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        largest = max(contours, key=cv2.contourArea)
+                        mx, my, mw, mh = cv2.boundingRect(largest)
+                        target_bbox = [
+                            [rx1 + mx, ry1 + my],
+                            [rx1 + mx + mw, ry1 + my],
+                            [rx1 + mx + mw, ry1 + my + mh],
+                            [rx1 + mx, ry1 + my + mh]
+                        ]
+
+                    return (target_bbox, translated_text, text_color, roi_target, (ry1, ry2, rx1, rx2))
+                else:
+                    # Fallback: relleno blanco
+                    x1, y1, x2, y2 = self.get_bbox_rect(bbox)
+                    roi_target = processed_image[y1:y2, x1:x2].copy()
+                    cv2.rectangle(roi_target, (0, 0), (x2 - x1, y2 - y1), (255, 255, 255), -1)
+                    return (bbox, translated_text, text_color, roi_target, (y1, y2, x1, x2))
+
+            except Exception as e:
+                logger.error(f"Error procesando globo '{text[:50]}...': {e}")
+                return None
+
+        results = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_bubble = {executor.submit(process_single_bubble, bubble): bubble for bubble in text_results}
+            for future in as_completed(future_to_bubble):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+
+        # Aplicar resultados
+        for target_bbox, translated_text, text_color, roi_target, (ry1, ry2, rx1, rx2) in results:
+            try:
+                processed_image[ry1:ry2, rx1:rx2] = roi_target
+                processed_image = self.render_text_in_mask(
+                    processed_image, translated_text, target_bbox, self.font_path, text_color
+                )
+            except Exception as e:
+                logger.error(f"Error aplicando resultado: {e}")
+                continue
+
         return original_image, processed_image
+
