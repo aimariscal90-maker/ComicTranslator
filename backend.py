@@ -41,7 +41,7 @@ class ComicTranslator:
     - Ajusta el tamaño de fuente dinámicamente para que quepa
     """
     
-    def __init__(self, font_path: Optional[str] = None):
+    def __init__(self, font_path: Optional[str] = None, debug_visuals: bool = False):
         """
         Inicializa el traductor de cómics.
         
@@ -50,9 +50,11 @@ class ComicTranslator:
         PASO 3: Configurar cliente de Google Cloud Vision
         PASO 4: Buscar y cargar la fuente de cómic
         PASO 5: Configurar parámetros de detección
+        PASO 6: Activar visualización de debug opcional (cajas coloreadas)
         
         Args:
             font_path: Ruta al archivo de fuente TTF (si es None, busca automáticamente)
+            debug_visuals: Si es True, pinta overlays de colores para ver padding/wrapping
         """
         # Cargar variables de entorno desde el archivo .env
         load_dotenv()
@@ -127,6 +129,9 @@ class ComicTranslator:
         
         # Mínimo: 0.01% del área (permite texto muy pequeño como "Ouch", "Eh?")
         self.min_bubble_area_ratio = 0.0001
+        
+        # Debug: overlays de colores para inspección visual
+        self.debug_visuals = debug_visuals
     
     def load_image(self, image_path: str) -> np.ndarray:
         """
@@ -232,7 +237,7 @@ class ComicTranslator:
             for block in page.blocks:
                 block_text = ""
 
-                # Reconstrucción del texto
+                # Reconstrucción del texto palabra a palabra para no perder separadores
                 word_confidences = []
                 for paragraph in block.paragraphs:
                     para_text = ""
@@ -253,11 +258,11 @@ class ComicTranslator:
                 else:
                     confidence = block.confidence if hasattr(block, 'confidence') else 0.5
 
-                # Filtrado por confianza
+                # Filtrado por confianza: descartamos bloques poco fiables
                 if confidence < min_confidence:
                     continue
 
-                # Bounding box
+                # Bounding box: lo guardamos para procesarlo después
                 vertices = block.bounding_box.vertices
                 bbox = [[v.x, v.y] for v in vertices]
 
@@ -336,24 +341,24 @@ class ComicTranslator:
 
             score = 0
 
-            # Factor área
+            # Factor área: prioriza contornos grandes (globos suelen ser amplios)
             score += area * 0.001
 
-            # Factor centro
+            # Factor centro: mejor si el texto queda dentro o muy cerca del contorno
             dist = cv2.pointPolygonTest(contour, (orig_cx, orig_cy), True)
             if dist >= 0:
                 score += 1000
             elif dist > -20:
                 score += 500 - (abs(dist) * 10)
 
-            # Factor circularidad
+            # Factor circularidad: globos suelen ser ovalados, evitamos formas raras
             perimeter = cv2.arcLength(contour, True)
             if perimeter > 0:
                 circularity = 4 * math.pi * area / (perimeter * perimeter)
                 if 0.3 <= circularity <= 1.5:
                     score += 200
 
-            # Factor proporción ancho/alto
+            # Factor proporción ancho/alto: penaliza contornos extremadamente alargados
             rect = cv2.boundingRect(contour)
             aspect_ratio = rect[2] / max(rect[3], 1)
             if 0.2 <= aspect_ratio <= 5.0:
@@ -436,6 +441,7 @@ class ComicTranslator:
         # Si es muy largo, dividir en chunks aproximados
         max_chunk_length = 400
         if len(text) > max_chunk_length:
+            # Partimos por frases aproximando a 400 chars para que el modelo no recorte
             sentences = text.split('. ')
             chunks = []
             current = ""
@@ -499,6 +505,7 @@ class ComicTranslator:
                 return translated
 
             except Exception as e:
+                # Reintento con backoff sencillo ante fallos puntuales de red/servicio
                 if attempt < max_retries - 1:
                     wait_time = retry_delay * (2 ** attempt)
                     logging.warning(f"Error de traducción (intento {attempt+1}): {e}. Reintentando en {wait_time}s")
@@ -546,13 +553,13 @@ class ComicTranslator:
         x_min, y_min, x_max, y_max = self.get_bbox_rect(bbox)
         box_width, box_height = x_max - x_min, y_max - y_min
 
-        # CAMBIO: Márgenes agresivos pero seguros (General para óvalos y rectángulos)
-        safe_width = int(box_width * 0.90) 
-        safe_height = int(box_height * 0.90)
+        # Márgenes mínimos: aprovechamos casi todo el globo para que el texto quede grande
+        safe_width = int(box_width * 0.998)
+        safe_height = int(box_height * 0.998)
 
         # Preparación del bucle
-        font_size = 60 # Empezar grande
-        min_font_size = 10
+        font_size = 80 # Empezar más grande para priorizar tamaño de letra
+        min_font_size = 12
         final_font = None
         final_lines = []
         final_line_height = 0
@@ -572,8 +579,8 @@ class ComicTranslator:
             ascent, descent = font.getmetrics()
             # Altura real de la línea + un pequeño respiro (no compresivo, estándar)
             line_height = ascent + descent 
-            # Espaciado mínimo para que no se peguen
-            line_spacing = int(font_size * 0.1) 
+            # Espaciado mínimo para que no se peguen (más compacto)
+            line_spacing = max(1, int(font_size * 0.02))
 
             # --- CÁLCULO HORIZONTAL ---
             # Usamos 'x' para asegurar que caben las mayúsculas anchas
@@ -581,7 +588,8 @@ class ComicTranslator:
             if avg_char_w == 0: avg_char_w = 1 # Evitar div por cero
             
             # Estimación inicial de caracteres por línea
-            chars_per_line = max(1, int(safe_width / avg_char_w))
+            # Añadimos margen positivo para evitar wrapping agresivo
+            chars_per_line = max(1, int((safe_width / avg_char_w) + 8))
             
             # Ajuste: Si la palabra más larga es más ancha que safe_width, esta fuente NO vale
             if font.getlength(longest_word) > safe_width:
@@ -612,23 +620,39 @@ class ComicTranslator:
         # Fallback si el bucle falla (usar fuente mínima)
         if final_font is None:
             final_font = ImageFont.truetype(font_path, min_font_size) if font_path else ImageFont.load_default()
-            final_lines = textwrap.wrap(text, width=15)
+            final_lines = textwrap.wrap(text, width=30)
             ascent, descent = final_font.getmetrics()
             final_line_height = ascent + descent
-            final_line_spacing = 2
+            final_line_spacing = 1
 
         # --- DIBUJADO ---
-        # Calcular altura total final para centrado vertical
+        # Calcular altura total final para centrado vertical dentro del bbox (el safe area es casi todo el bbox)
         total_h = (final_line_height * len(final_lines)) + (final_line_spacing * (len(final_lines) - 1))
         start_y = y_min + (box_height - total_h) // 2
         
         current_y = start_y
+        if self.debug_visuals:
+            # Borde exterior del bbox original (rojo):
+            # Es la caja de texto que devuelve Vision para el globo detectado.
+            draw.rectangle([x_min, y_min, x_max, y_max], outline=(255, 0, 0), width=2)
+            # Área segura usada para cálculo de texto (azul):
+            # Es el bbox con un pequeño margen (0.2%) donde estimamos wrapping y centrado.
+            safe_x1 = x_min + (box_width - safe_width) // 2
+            safe_y1 = y_min + (box_height - safe_height) // 2
+            safe_x2 = safe_x1 + safe_width
+            safe_y2 = safe_y1 + safe_height
+            draw.rectangle([safe_x1, safe_y1, safe_x2, safe_y2], outline=(0, 0, 255), width=2)
+        
         for line in final_lines:
             w = final_font.getlength(line)
-            # Centrado horizontal exacto
+            # Centrado horizontal exacto respecto al bbox completo
             x = x_min + (box_width - w) // 2
             
             draw.text((x, current_y), line, font=final_font, fill=text_color)
+            if self.debug_visuals:
+                # Caja de cada línea renderizada (verde):
+                # Muestra exactamente la anchura de la línea colocada.
+                draw.rectangle([x, current_y, x + w, current_y + final_line_height], outline=(0, 200, 0), width=1)
             current_y += final_line_height + final_line_spacing
 
         return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
@@ -673,7 +697,7 @@ class ComicTranslator:
                 if not translated_text.strip():
                     translated_text = text
 
-                # Máscara
+                # Máscara: detecta contorno real del globo y color de fondo
                 mask, (rx1, ry1, rx2, ry2) = self.get_contour_mask(original_image, bbox)
                 target_bbox = bbox
                 text_color = (0, 0, 0)

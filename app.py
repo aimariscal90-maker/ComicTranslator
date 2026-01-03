@@ -20,7 +20,8 @@ st.markdown("Translate comic book pages from English to Spanish (Spain)")
 # Initialize session state
 if 'translator' not in st.session_state:
     try:
-        st.session_state.translator = ComicTranslator()
+        # Activamos visualizaciones de depuración para ver cajas y padding coloreados
+        st.session_state.translator = ComicTranslator(debug_visuals=True)
     except Exception as e:
         st.error(f"Error initializing translator: {e}")
         st.stop()
